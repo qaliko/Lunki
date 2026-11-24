@@ -1,36 +1,779 @@
-# This is a basic workflow to help you get started with Actions
-
-name: CI
-
-# Controls when the workflow will run
+name: Build Lunki APK
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
-
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+  push:
+    branches: [main, master]
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
-
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          mkdir LunkiBot && cd LunkiBot
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.lunkibot"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.lunkibot"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".BotService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+
+                  <service
+                      android:name=".TapService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/lunkibot
+          cat > app/src/main/java/com/example/lunkibot/BotService.kt <<'EOF_FILE'
+          package com.example.lunkibot
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.Icon
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.Image
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.util.DisplayMetrics
+          import android.view.WindowManager
+          import java.util.Random
+
+          /** Foreground-сервис: снимает экран, понимает стадию игры и играет. */
+          class BotService : Service() {
+
+              companion object {
+                  const val ACTION_STOP = "com.example.lunkibot.STOP"
+                  const val EXTRA_CODE = "code"
+                  const val EXTRA_DATA = "data"
+
+                  @Volatile var running = false
+
+                  /** Забрать выигрыш, когда открыто столько рыбок. */
+                  @Volatile var targetFish = 3
+
+                  /** Максимум раундов (0 = без ограничения). */
+                  @Volatile var maxRounds = 0
+
+                  @Volatile var rounds = 0
+                  @Volatile var wins = 0
+                  @Volatile var losses = 0
+              }
+
+              /** Снимок экрана в виде нужных нам признаков. */
+              private class Snap(
+                  val time: Long,
+                  val boardTop: Float,   // верх игрового поля (доля высоты), -1 если не найден
+                  val btnY: Float,       // центр красной кнопки (доля высоты), -1 если нет
+                  val cells: IntArray    // 25 лунок: 0 закрыта, 1 рыбка, 2 другое
+              )
+
+              private var projection: MediaProjection? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              @Volatile private var alive = false
+              private var worker: Thread? = null
+              private val rnd = Random()
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  if (running) return START_NOT_STICKY
+
+                  startForegroundCompat()
+
+                  val code = intent?.getIntExtra(EXTRA_CODE, 0) ?: 0
+                  @Suppress("DEPRECATION")
+                  val data: Intent? = intent?.getParcelableExtra(EXTRA_DATA)
+                  if (data == null) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  projection = mpm.getMediaProjection(code, data)
+                  projection?.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() {
+                          stopSelf()
+                      }
+                  }, Handler(Looper.getMainLooper()))
+
+                  val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  val dm = DisplayMetrics()
+                  @Suppress("DEPRECATION")
+                  wm.defaultDisplay.getRealMetrics(dm)
+                  val w = dm.widthPixels
+                  val h = dm.heightPixels
+
+                  reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                  virtualDisplay = projection?.createVirtualDisplay(
+                      "lunkibot", w, h, dm.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      reader!!.surface, null, null
+                  )
+
+                  rounds = 0
+                  wins = 0
+                  losses = 0
+                  running = true
+                  alive = true
+                  worker = Thread { loop(w, h) }.also { it.start() }
+                  return START_NOT_STICKY
+              }
+
+              // ---------- разбор кадра ----------
+
+              private fun rgb(buf: java.nio.ByteBuffer, rowStride: Int, pixelStride: Int, w: Int, h: Int, x: Int, y: Int): Int {
+                  val xx = x.coerceIn(0, w - 1)
+                  val yy = y.coerceIn(0, h - 1)
+                  val off = yy * rowStride + xx * pixelStride
+                  val r = buf.get(off).toInt() and 0xFF
+                  val g = buf.get(off + 1).toInt() and 0xFF
+                  val b = buf.get(off + 2).toInt() and 0xFF
+                  return (r shl 16) or (g shl 8) or b
+              }
+
+              private fun isCrimson(c: Int): Boolean {
+                  val r = (c shr 16) and 0xFF
+                  val g = (c shr 8) and 0xFF
+                  val b = c and 0xFF
+                  return r in 170..215 && g in 45..90 && b in 70..120
+              }
+
+              /** 0 — закрытая лунка, 1 — рыбка (розовый), 2 — всё остальное. */
+              private fun cls(c: Int): Int {
+                  val r = (c shr 16) and 0xFF
+                  val g = (c shr 8) and 0xFF
+                  val b = c and 0xFF
+                  if (Math.abs(r - 200) <= 12 && Math.abs(g - 206) <= 12 && Math.abs(b - 220) <= 12) return 0
+                  if (r >= 232 && r - g >= 25 && b >= g) return 1
+                  return 2
+              }
+
+              private fun makeSnap(image: Image, w: Int, h: Int, now: Long): Snap {
+                  val plane = image.planes[0]
+                  val buf = plane.buffer
+                  val rs = plane.rowStride
+                  val ps = plane.pixelStride
+
+                  // верх игрового поля: идём вниз по щели между колонками лунок
+                  val gx = (0.4167f * w).toInt()
+                  var top = -1f
+                  var y = (0.11f * h).toInt()
+                  val yTopEnd = (0.60f * h).toInt()
+                  while (y < yTopEnd) {
+                      val c = rgb(buf, rs, ps, w, h, gx, y)
+                      val r = (c shr 16) and 0xFF
+                      val g = (c shr 8) and 0xFF
+                      val b = c and 0xFF
+                      if (r > 225 && g > 225 && b > 225) {
+                          top = y.toFloat() / h
+                          break
+                      }
+                      y += 2
+                  }
+
+                  // красная кнопка: ищем сплошную красную полосу в колонке слева
+                  val bx = (Config.BTN_COL_X * w).toInt()
+                  var btn = -1f
+                  var runStart = -1
+                  val minRun = (0.03f * h).toInt()
+                  y = (0.15f * h).toInt()
+                  val yBtnEnd = (0.985f * h).toInt()
+                  while (y < yBtnEnd) {
+                      if (isCrimson(rgb(buf, rs, ps, w, h, bx, y))) {
+                          if (runStart < 0) runStart = y
+                      } else if (runStart >= 0) {
+                          if (y - runStart >= minRun) {
+                              btn = ((runStart + y) / 2f) / h
+                              break
+                          }
+                          runStart = -1
+                      }
+                      y += 2
+                  }
+
+                  // 25 лунок
+                  val cells = IntArray(25)
+                  val dx = (Config.SAMPLE_DX * w).toInt()
+                  val dy = (Config.SAMPLE_DY * h).toInt()
+                  for (row in 0 until 5) {
+                      for (col in 0 until 5) {
+                          val cx = (Config.CELL_X[col] * w).toInt()
+                          val cy = (Config.CELL_Y[row] * h).toInt()
+                          val p1 = cls(rgb(buf, rs, ps, w, h, cx - dx, cy - dy))
+                          val p2 = cls(rgb(buf, rs, ps, w, h, cx + dx, cy + dy))
+                          cells[row * 5 + col] = when {
+                              p1 == 0 || p2 == 0 -> 0
+                              p1 == 1 || p2 == 1 -> 1
+                              else -> 2
+                          }
+                      }
+                  }
+                  return Snap(now, top, btn, cells)
+              }
+
+              // ---------- главный цикл ----------
+
+              private fun loop(w: Int, h: Int) {
+                  try {
+                      Thread.sleep(Config.START_DELAY_MS)
+                  } catch (e: InterruptedException) {
+                      return
+                  }
+
+                  var snap: Snap? = null
+                  var lastAction = 0L
+                  var settle = 0L
+                  var inRound = false
+                  var cashed = false
+                  var noProgress = 0
+
+                  fun tapAt(xf: Float, yf: Float) {
+                      TapService.instance?.tap(xf * w, yf * h)
+                  }
+
+                  fun endRound() {
+                      if (inRound) {
+                          if (cashed) wins++ else losses++
+                          inRound = false
+                          cashed = false
+                      }
+                  }
+
+                  fun doAction(settleMs: Long) {
+                      lastAction = System.currentTimeMillis()
+                      settle = settleMs
+                  }
+
+                  fun pressStart(yFrac: Float) {
+                      endRound()
+                      if (maxRounds > 0 && rounds >= maxRounds) {
+                          alive = false
+                          stopSelf()
+                          return
+                      }
+                      tapAt(0.5f, yFrac)
+                      rounds++
+                      inRound = true
+                      cashed = false
+                      noProgress = 0
+                      doAction(Config.START_SETTLE_MS)
+                  }
+
+                  fun swipeUp() {
+                      TapService.instance?.swipe(0.5f * w, 0.80f * h, 0.5f * w, 0.30f * h, 300)
+                      doAction(Config.SWIPE_SETTLE_MS)
+                  }
+
+                  while (alive) {
+                      try {
+                          Thread.sleep(Config.POLL_MS)
+                      } catch (e: InterruptedException) {
+                          return
+                      }
+
+                      val now = System.currentTimeMillis()
+
+                      // свежий кадр (если экран не менялся — нового кадра не будет, берём прошлый)
+                      val image = reader?.acquireLatestImage()
+                      if (image != null) {
+                          try {
+                              snap = makeSnap(image, w, h, now)
+                          } finally {
+                              image.close()
+                          }
+                      }
+                      val s = snap ?: continue
+
+                      if (now - lastAction < settle) continue
+                      // после действия ждём хотя бы один новый кадр (но не дольше 2 с)
+                      if (s.time < lastAction && now - lastAction < 2000) continue
+
+                      val unscrolled = s.boardTop >= 0 && Math.abs(s.boardTop - Config.BOARD_TOP) <= Config.BOARD_TOL
+
+                      if (unscrolled) {
+                          val b = s.btnY
+                          if (b >= 0 && Math.abs(b - Config.PLAY_BTN_Y) <= Config.BTN_TOL) {
+                              // ---- идёт игра ----
+                              if (!inRound) {
+                                  inRound = true
+                                  cashed = false
+                              }
+                              var fish = 0
+                              val closed = ArrayList<Int>()
+                              for (i in 0 until 25) {
+                                  if (s.cells[i] == 1) fish++
+                                  if (s.cells[i] == 0) closed.add(i)
+                              }
+                              if (fish >= targetFish || closed.isEmpty()) {
+                                  tapAt(0.5f, b)
+                                  cashed = true
+                                  doAction(Config.CASH_SETTLE_MS)
+                              } else {
+                                  val idx = closed[rnd.nextInt(closed.size)]
+                                  tapAt(Config.CELL_X[idx % 5], Config.CELL_Y[idx / 5])
+                                  doAction(Config.CELL_SETTLE_MS)
+                              }
+                          } else if (b >= 0 && Math.abs(b - Config.START_BTN_Y) <= Config.BTN_TOL) {
+                              // ---- экран перед игрой ----
+                              pressStart(b)
+                          } else {
+                              // ---- результат: кнопка «Начать» ниже края экрана ----
+                              endRound()
+                              noProgress++
+                              if (noProgress >= 3) {
+                                  tapAt(0.5f, 0.9988f)
+                                  noProgress = 0
+                                  doAction(Config.START_SETTLE_MS)
+                              } else {
+                                  swipeUp()
+                              }
+                          }
+                      } else {
+                          // страница прокручена: ищем кнопку «Начать»
+                          val b = s.btnY
+                          if (b >= 0) {
+                              pressStart(b)
+                          } else {
+                              endRound()
+                              swipeUp()
+                          }
+                      }
+                  }
+              }
+
+              private fun startForegroundCompat() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("lunkibot", "Лунки Бот", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val stopIntent = PendingIntent.getService(
+                      this, 0,
+                      Intent(this, BotService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, "lunkibot")
+                      .setContentTitle("Лунки Бот работает")
+                      .setContentText("Нажми, чтобы остановить")
+                      .setSmallIcon(android.R.drawable.ic_media_play)
+                      .setContentIntent(stopIntent)
+                      .addAction(
+                          Notification.Action.Builder(
+                              Icon.createWithResource(this, android.R.drawable.ic_media_pause), "Стоп", stopIntent
+                          ).build()
+                      )
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              override fun onDestroy() {
+                  alive = false
+                  running = false
+                  worker?.interrupt()
+                  virtualDisplay?.release()
+                  reader?.close()
+                  projection?.stop()
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/lunkibot
+          cat > app/src/main/java/com/example/lunkibot/Config.kt <<'EOF_FILE'
+          package com.example.lunkibot
+
+          /**
+           * Координаты — доли экрана (0..1), посчитаны по скриншотам игры «Лунки».
+           * Если игра обновит дизайн, меняй значения здесь.
+           */
+          object Config {
+              // Центры лунок 5x5: по горизонтали (колонки) и по вертикали (ряды)
+              val CELL_X = floatArrayOf(0.1674f, 0.3339f, 0.4996f, 0.6661f, 0.8318f)
+              val CELL_Y = floatArrayOf(0.3152f, 0.3905f, 0.4662f, 0.5416f, 0.6172f)
+
+              // Смещение точек, где смотрим цвет лунки (чтобы не попасть на пузырёк/рыбку)
+              const val SAMPLE_DX = 0.0512f
+              const val SAMPLE_DY = 0.0155f
+
+              // Верх игрового поля при неприкрученной странице и допуск
+              const val BOARD_TOP = 0.269f
+              const val BOARD_TOL = 0.012f
+
+              // Где красная кнопка: «Забрать» (идёт игра) и «Начать» (до игры), допуск
+              const val PLAY_BTN_Y = 0.728f
+              const val START_BTN_Y = 0.932f
+              const val BTN_TOL = 0.020f
+
+              // Колонка экрана, по которой ищем красную кнопку (слева, без текста)
+              const val BTN_COL_X = 0.12f
+
+              // Паузы (мс)
+              const val START_DELAY_MS = 5000L      // после запуска, чтобы успеть открыть игру
+              const val POLL_MS = 60L               // как часто смотрим экран
+              const val CELL_SETTLE_MS = 700L       // после нажатия на лунку (анимация)
+              const val CASH_SETTLE_MS = 1200L      // после «Забрать»
+              const val START_SETTLE_MS = 1500L     // после «Начать»
+              const val SWIPE_SETTLE_MS = 800L      // после прокрутки вниз
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/lunkibot
+          cat > app/src/main/java/com/example/lunkibot/MainActivity.kt <<'EOF_FILE'
+          package com.example.lunkibot
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+              private lateinit var targetText: TextView
+              private lateinit var roundsText: TextView
+              private lateinit var chanceText: TextView
+              private lateinit var prefs: SharedPreferences
+              private val reqProjection = 1001
+              private val sharkOptions = intArrayOf(3, 5, 8, 12)
+              private var sharkIdx = 0
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  prefs = getSharedPreferences("lunki", Context.MODE_PRIVATE)
+                  BotService.targetFish = prefs.getInt("target", 3)
+                  BotService.maxRounds = prefs.getInt("max_rounds", 0)
+                  sharkIdx = prefs.getInt("shark_idx", 0).coerceIn(0, sharkOptions.size - 1)
+
+                  val pad = (20 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+
+                  fun label(): TextView {
+                      val t = TextView(this)
+                      t.textSize = 16f
+                      t.gravity = Gravity.CENTER
+                      t.setPadding(0, pad / 2, 0, pad / 4)
+                      root.addView(t)
+                      return t
+                  }
+
+                  fun buttonRow(vararg items: Pair<String, () -> Unit>) {
+                      val row = LinearLayout(this)
+                      row.orientation = LinearLayout.HORIZONTAL
+                      for ((text, action) in items) {
+                          val b = Button(this)
+                          b.text = text
+                          b.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                          b.setOnClickListener { action() }
+                          row.addView(b)
+                      }
+                      root.addView(row)
+                  }
+
+                  status = label()
+
+                  // --- сколько рыбок собрать до «Забрать» ---
+                  targetText = label()
+                  buttonRow(
+                      "−" to { changeTarget(-1) },
+                      "+" to { changeTarget(1) }
+                  )
+
+                  // --- лимит раундов ---
+                  roundsText = label()
+                  buttonRow(
+                      "−10" to { changeRounds(-10) },
+                      "−1" to { changeRounds(-1) },
+                      "+1" to { changeRounds(1) },
+                      "+10" to { changeRounds(10) }
+                  )
+
+                  // --- справочный расчёт шанса ---
+                  chanceText = label()
+                  buttonRow("Сменить число акул (для расчёта)" to { changeSharks() })
+
+                  // --- запуск ---
+                  val spacer = TextView(this)
+                  spacer.setPadding(0, pad, 0, 0)
+                  root.addView(spacer)
+                  buttonRow("1. Включить спец. возможности" to {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  buttonRow("2. Запустить бота" to { startBot() })
+                  buttonRow("Остановить" to {
+                      startService(Intent(this, BotService::class.java).setAction(BotService.ACTION_STOP))
+                  })
+
+                  setContentView(root)
+                  refreshTexts()
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2002)
+                  }
+              }
+
+              private fun changeTarget(delta: Int) {
+                  val v = (BotService.targetFish + delta).coerceIn(1, 25)
+                  BotService.targetFish = v
+                  prefs.edit().putInt("target", v).apply()
+                  refreshTexts()
+              }
+
+              private fun changeRounds(delta: Int) {
+                  val v = (BotService.maxRounds + delta).coerceIn(0, 1000)
+                  BotService.maxRounds = v
+                  prefs.edit().putInt("max_rounds", v).apply()
+                  refreshTexts()
+              }
+
+              private fun changeSharks() {
+                  sharkIdx = (sharkIdx + 1) % sharkOptions.size
+                  prefs.edit().putInt("shark_idx", sharkIdx).apply()
+                  refreshTexts()
+              }
+
+              /** Шанс открыть n безопасных лунок подряд при s акулах из 25. */
+              private fun surviveProb(sharks: Int, n: Int): Double {
+                  var p = 1.0
+                  for (i in 0 until n) {
+                      val safeLeft = 25.0 - sharks - i
+                      if (safeLeft <= 0) return 0.0
+                      p *= safeLeft / (25.0 - i)
+                  }
+                  return p
+              }
+
+              private fun refreshTexts() {
+                  targetText.text = "Забирать после рыбок: ${BotService.targetFish}"
+                  roundsText.text = if (BotService.maxRounds == 0)
+                      "Раундов: без ограничения"
+                  else
+                      "Остановиться после раундов: ${BotService.maxRounds}"
+                  val s = sharkOptions[sharkIdx]
+                  val p = surviveProb(s, BotService.targetFish) * 100.0
+                  chanceText.text = "Шанс дойти до ${BotService.targetFish} рыбок при $s акулах: " +
+                      String.format("%.1f", p) + "%"
+              }
+
+              private fun startBot() {
+                  if (TapService.instance == null) {
+                      Toast.makeText(this, "Сначала включи спец. возможности (шаг 1)", Toast.LENGTH_LONG).show()
+                      return
+                  }
+                  val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(mpm.createScreenCaptureIntent(), reqProjection)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == reqProjection && resultCode == RESULT_OK && data != null) {
+                      val i = Intent(this, BotService::class.java)
+                      i.putExtra(BotService.EXTRA_CODE, resultCode)
+                      i.putExtra(BotService.EXTRA_DATA, data)
+                      startForegroundService(i)
+                      Toast.makeText(
+                          this,
+                          "Старт через ${Config.START_DELAY_MS / 1000} c — открой игру на экране «Лунки»",
+                          Toast.LENGTH_LONG
+                      ).show()
+                      moveTaskToBack(true)
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val a11y = if (TapService.instance != null) "включены" else "выключены"
+                  val bot = if (BotService.running) "работает" else "остановлен"
+                  status.text = "Спец. возможности: $a11y\nБот: $bot\n" +
+                      "Раундов: ${BotService.rounds}, забрал: ${BotService.wins}, акула: ${BotService.losses}"
+                  refreshTexts()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/lunkibot
+          cat > app/src/main/java/com/example/lunkibot/TapService.kt <<'EOF_FILE'
+          package com.example.lunkibot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+
+          /** Спец. возможности: тапы и свайпы в нужных точках экрана. */
+          class TapService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: TapService? = null
+              }
+
+              override fun onServiceConnected() {
+                  instance = this
+              }
+
+              override fun onUnbind(intent: android.content.Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun tap(x: Float, y: Float) {
+                  val path = Path().apply { moveTo(x, y) }
+                  val stroke = GestureDescription.StrokeDescription(path, 0, 40)
+                  dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+              }
+
+              fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long) {
+                  val path = Path().apply {
+                      moveTo(x1, y1)
+                      lineTo(x2, y2)
+                  }
+                  val stroke = GestureDescription.StrokeDescription(path, 0, durationMs)
+                  dispatchGesture(GestureDescription.Builder().addStroke(stroke).build(), null, null)
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources>
+              <string name="app_name">Лунки Бот</string>
+              <string name="a11y_desc">Нажимает на лунки и кнопки в игре «Лунки»</string>
+          </resources>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/a11y_desc"
+              android:notificationTimeout="100" />
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "LunkiBot"
+          include(":app")
+          EOF_FILE
+      - name: Build
+        working-directory: LunkiBot
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Lunki-apk
+          path: LunkiBot/app/build/outputs/apk/debug/*.apk
